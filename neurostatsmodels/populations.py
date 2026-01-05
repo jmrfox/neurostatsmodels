@@ -14,29 +14,27 @@ class GaussianTunedPopulation:
     """Population of neurons with Gaussian tuning curves.
 
     Each neuron has a tuning curve r(s) = max_rate * exp(-0.5 * ((s - mean) / sigma)^2)
-    where s is the stimulus value.
+    where s is the stimulus value, and max_rate = reference_rate * (reference_sigma / sigma).
 
     Parameters
     ----------
     n_neurons : int
         Number of neurons in the population
-    max_rate : float or array-like
-        Maximum firing rate(s) in Hz. If float, all neurons have the same max_rate.
-        If array-like, must have length n_neurons.
+    reference_rate : float
+        Reference firing rate in Hz. Used to compute max_rate for each neuron.
+    reference_sigma : float
+        Reference tuning width. Used to compute max_rate for each neuron.
     """
 
-    def __init__(self, n_neurons, max_rate=100.0):
+    def __init__(self, n_neurons, reference_rate=100.0, reference_sigma=50.0):
         self.n_neurons = n_neurons
-
-        if np.isscalar(max_rate):
-            self.max_rate = np.full(n_neurons, max_rate, dtype=float)
-        else:
-            self.max_rate = np.asarray(max_rate, dtype=float)
-            if len(self.max_rate) != n_neurons:
-                raise ValueError(f"max_rate must have length {n_neurons}")
+        self.reference_rate = reference_rate
+        self.reference_sigma = reference_sigma
 
         self.means = None
         self.sigmas = None
+        self.refractory_periods = None
+        self.spontaneous_rates = None
 
         self.stimulus_grid = None
         self.tuning_curves = None
@@ -85,6 +83,44 @@ class GaussianTunedPopulation:
             if len(self.sigmas) != self.n_neurons:
                 raise ValueError(f"sigmas must have length {self.n_neurons}")
 
+    def set_refractory_periods(self, refractory_periods):
+        """Set the refractory periods for each neuron.
+
+        Parameters
+        ----------
+        refractory_periods : float or array-like
+            Refractory periods in seconds. If float, all neurons have the same
+            refractory period. If array-like, must have length n_neurons.
+        """
+        if np.isscalar(refractory_periods):
+            self.refractory_periods = np.full(
+                self.n_neurons, refractory_periods, dtype=float
+            )
+        else:
+            self.refractory_periods = np.asarray(refractory_periods, dtype=float)
+            if len(self.refractory_periods) != self.n_neurons:
+                raise ValueError(
+                    f"refractory_periods must have length {self.n_neurons}"
+                )
+
+    def set_spontaneous_rates(self, spontaneous_rates):
+        """Set the spontaneous (baseline) firing rates for each neuron.
+
+        Parameters
+        ----------
+        spontaneous_rates : float or array-like
+            Spontaneous firing rates in Hz. If float, all neurons have the same
+            spontaneous rate. If array-like, must have length n_neurons.
+        """
+        if np.isscalar(spontaneous_rates):
+            self.spontaneous_rates = np.full(
+                self.n_neurons, spontaneous_rates, dtype=float
+            )
+        else:
+            self.spontaneous_rates = np.asarray(spontaneous_rates, dtype=float)
+            if len(self.spontaneous_rates) != self.n_neurons:
+                raise ValueError(f"spontaneous_rates must have length {self.n_neurons}")
+
     def compute_rates(self, stimulus):
         """Compute firing rates for all neurons at given stimulus value(s).
 
@@ -108,11 +144,18 @@ class GaussianTunedPopulation:
         if is_scalar:
             stimulus = stimulus.reshape(1)
 
+        # Compute max_rate for each neuron based on its sigma
+        max_rate = self.reference_rate * (self.reference_sigma / self.sigmas)
+
         # Broadcast: (n_neurons, 1) - (1, n_stimuli) -> (n_neurons, n_stimuli)
         z = (stimulus[np.newaxis, :] - self.means[:, np.newaxis]) / self.sigmas[
             :, np.newaxis
         ]
-        rates = self.max_rate[:, np.newaxis] * np.exp(-0.5 * z**2)
+        rates = max_rate[:, np.newaxis] * np.exp(-0.5 * z**2)
+
+        # Add spontaneous rate if set
+        if self.spontaneous_rates is not None:
+            rates = rates + self.spontaneous_rates[:, np.newaxis]
 
         if is_scalar:
             return rates.squeeze()
@@ -150,13 +193,13 @@ class GaussianTunedPopulation:
 
         # Extract rates from TsdFrame
         rates = self.tuning_curves.values.T  # shape: (n_neurons, n_stim)
-        
+
         # Compute derivative for each neuron's tuning curve
         dr_ds = np.gradient(rates, self.stimulus_grid, axis=1)
 
         # Compute Fisher information
         fi = dr_ds**2 / (rates + epsilon)
-        
+
         # Store as TsdFrame
         self.fisher_info_curves = nap.TsdFrame(t=self.stimulus_grid, d=fi.T)
 
@@ -267,7 +310,7 @@ class GaussianTunedPopulation:
         spikes : nap.TsGroup or dict of nap.TsGroup
             - If stimulus is scalar: Single TsGroup with one Ts per neuron
             - If stimulus is array: dict {stimulus_idx: TsGroup} for each stimulus
-            
+
             Each TsGroup contains spike times for all neurons across all trials.
             Trial epochs are stored in the time_support attribute.
 
@@ -277,7 +320,7 @@ class GaussianTunedPopulation:
         >>> spikes = pop.generate_spikes(0.0, duration=1.0, n_trials=5)
         >>> # Access neuron 3
         >>> spike_train = spikes[3]
-        >>> 
+        >>>
         >>> # Multiple stimuli
         >>> spikes = pop.generate_spikes([0, 50, 100], duration=1.0, n_trials=5)
         >>> # Access stimulus 1, neuron 3
@@ -293,11 +336,11 @@ class GaussianTunedPopulation:
         # Compute firing rates
         rates = self.compute_rates(stimulus)
         is_scalar = rates.ndim == 1
-        
+
         # Create trial epochs as IntervalSet
         trial_epochs = nap.IntervalSet(
             start=np.arange(n_trials) * duration,
-            end=(np.arange(n_trials) + 1) * duration
+            end=(np.arange(n_trials) + 1) * duration,
         )
 
         if is_scalar:
@@ -306,7 +349,12 @@ class GaussianTunedPopulation:
             for neuron_idx in range(self.n_neurons):
                 rate = rates[neuron_idx]
                 all_times = []
-                
+
+                # Get refractory period for this neuron (0 if not set)
+                refrac = 0.0
+                if self.refractory_periods is not None:
+                    refrac = self.refractory_periods[neuron_idx]
+
                 for trial_idx in range(n_trials):
                     trial_start = trial_idx * duration
                     if rate > 0:
@@ -316,25 +364,44 @@ class GaussianTunedPopulation:
                             t += isi
                             if t < duration:
                                 all_times.append(trial_start + t)
-                
-                neuron_spikes[neuron_idx] = nap.Ts(t=np.array(all_times), time_support=trial_epochs)
-            
+                                # Add refractory period to prevent immediate next spike
+                                t += refrac
+
+                neuron_spikes[neuron_idx] = nap.Ts(
+                    t=np.array(all_times), time_support=trial_epochs
+                )
+
             # Create TsGroup with metadata
             tsgroup = nap.TsGroup(neuron_spikes, time_support=trial_epochs)
-            tsgroup.set_info(mean=self.means, sigma=self.sigmas, max_rate=self.max_rate)
+            metadata = {
+                "mean": self.means,
+                "sigma": self.sigmas,
+                "reference_rate": np.full(self.n_neurons, self.reference_rate),
+                "reference_sigma": np.full(self.n_neurons, self.reference_sigma),
+            }
+            if self.refractory_periods is not None:
+                metadata["refractory_period"] = self.refractory_periods
+            if self.spontaneous_rates is not None:
+                metadata["spontaneous_rate"] = self.spontaneous_rates
+            tsgroup.set_info(**metadata)
             return tsgroup
-            
+
         else:
             # Multiple stimuli: return dict of TsGroups
             n_stimuli = rates.shape[1]
             result = {}
-            
+
             for stim_idx in range(n_stimuli):
                 neuron_spikes = {}
                 for neuron_idx in range(self.n_neurons):
                     rate = rates[neuron_idx, stim_idx]
                     all_times = []
-                    
+
+                    # Get refractory period for this neuron (0 if not set)
+                    refrac = 0.0
+                    if self.refractory_periods is not None:
+                        refrac = self.refractory_periods[neuron_idx]
+
                     for trial_idx in range(n_trials):
                         trial_start = trial_idx * duration
                         if rate > 0:
@@ -344,13 +411,27 @@ class GaussianTunedPopulation:
                                 t += isi
                                 if t < duration:
                                     all_times.append(trial_start + t)
-                    
-                    neuron_spikes[neuron_idx] = nap.Ts(t=np.array(all_times), time_support=trial_epochs)
-                
+                                    # Add refractory period to prevent immediate next spike
+                                    t += refrac
+
+                    neuron_spikes[neuron_idx] = nap.Ts(
+                        t=np.array(all_times), time_support=trial_epochs
+                    )
+
                 tsgroup = nap.TsGroup(neuron_spikes, time_support=trial_epochs)
-                tsgroup.set_info(mean=self.means, sigma=self.sigmas, max_rate=self.max_rate)
+                metadata = {
+                    "mean": self.means,
+                    "sigma": self.sigmas,
+                    "reference_rate": np.full(self.n_neurons, self.reference_rate),
+                    "reference_sigma": np.full(self.n_neurons, self.reference_sigma),
+                }
+                if self.refractory_periods is not None:
+                    metadata["refractory_period"] = self.refractory_periods
+                if self.spontaneous_rates is not None:
+                    metadata["spontaneous_rate"] = self.spontaneous_rates
+                tsgroup.set_info(**metadata)
                 result[stim_idx] = tsgroup
-            
+
             return result
 
     def compute_fisher_information(self, stimulus, epsilon=1e-10):
@@ -441,7 +522,7 @@ class GaussianTunedPopulation:
         # Extract trial epochs from time_support
         trial_epochs = tsgroup.time_support
         n_trials = len(trial_epochs)
-        
+
         # Define stimulus grid to search over
         if stimulus_range is None:
             if self.stimulus_grid is not None:
@@ -456,22 +537,22 @@ class GaussianTunedPopulation:
 
         # Compute firing rates for all stimulus values
         rates = self.compute_rates(stim_grid)  # shape: (n_neurons, n_stim)
-        
+
         # Decode each trial independently
         s_mle = np.zeros(n_trials)
-        
+
         for trial_idx in range(n_trials):
             # Get trial interval
             trial_start = trial_epochs.start[trial_idx]
             trial_end = trial_epochs.end[trial_idx]
             duration = trial_end - trial_start
-            
+
             # Count spikes for this trial using restrict
             spike_counts = np.zeros(self.n_neurons)
             for neuron_idx in range(self.n_neurons):
                 trial_spikes = tsgroup[neuron_idx].restrict(trial_epochs[trial_idx])
                 spike_counts[neuron_idx] = len(trial_spikes)
-            
+
             # Compute log-likelihood for each stimulus value
             log_likelihood = np.zeros(len(stim_grid))
             for i in range(len(stim_grid)):
@@ -480,8 +561,8 @@ class GaussianTunedPopulation:
                 log_likelihood[i] = np.sum(
                     spike_counts * np.log(rate_vec + 1e-10) - rate_vec * duration
                 )
-            
+
             # Find stimulus with maximum log-likelihood for this trial
             s_mle[trial_idx] = stim_grid[np.argmax(log_likelihood)]
-        
+
         return s_mle
