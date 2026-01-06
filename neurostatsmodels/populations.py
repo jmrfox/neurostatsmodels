@@ -226,10 +226,12 @@ class GaussianTunedPopulation:
         if is_scalar:
             stimulus = np.array([stimulus])
 
-        # Wrap stimulus in Tsd for interpolation
-        stimulus_tsd = nap.Tsd(t=stimulus, d=np.zeros(len(stimulus)))
-        interpolated = self.tuning_curves.interpolate(stimulus_tsd, ep=None)
-        rates = interpolated.values.T  # shape: (n_neurons, n_stimuli)
+        # Interpolate each neuron's tuning curve at the stimulus values
+        rates = np.zeros((self.n_neurons, len(stimulus)))
+        for i in range(self.n_neurons):
+            rates[i, :] = np.interp(
+                stimulus, self.stimulus_grid, self.tuning_curves.values[:, i]
+            )
 
         if is_scalar:
             return rates.squeeze()
@@ -258,10 +260,12 @@ class GaussianTunedPopulation:
         if is_scalar:
             stimulus = np.array([stimulus])
 
-        # Wrap stimulus in Tsd for interpolation
-        stimulus_tsd = nap.Tsd(t=stimulus, d=np.zeros(len(stimulus)))
-        interpolated = self.fisher_info_curves.interpolate(stimulus_tsd, ep=None)
-        fisher_info = interpolated.values.T  # shape: (n_neurons, n_stimuli)
+        # Interpolate each neuron's FI curve at the stimulus values
+        fisher_info = np.zeros((self.n_neurons, len(stimulus)))
+        for i in range(self.n_neurons):
+            fisher_info[i, :] = np.interp(
+                stimulus, self.stimulus_grid, self.fisher_info_curves.values[:, i]
+            )
 
         if is_scalar:
             return fisher_info.squeeze()
@@ -333,15 +337,20 @@ class GaussianTunedPopulation:
         else:
             rng = random_state
 
+        # Validate duration
+        if duration <= 0:
+            raise ValueError("duration must be positive")
+
         # Compute firing rates
         rates = self.compute_rates(stimulus)
         is_scalar = rates.ndim == 1
 
         # Create trial epochs as IntervalSet
-        trial_epochs = nap.IntervalSet(
-            start=np.arange(n_trials) * duration,
-            end=(np.arange(n_trials) + 1) * duration,
-        )
+        # Add small gap (1 microsecond) between trials to avoid boundary overlap
+        gap = 1e-6  # 1 microsecond gap between trials
+        starts = np.arange(n_trials, dtype=np.float64) * (duration + gap)
+        ends = starts + duration
+        trial_epochs = nap.IntervalSet(start=starts, end=ends)
 
         if is_scalar:
             # Single stimulus: generate spikes for all neurons across all trials
