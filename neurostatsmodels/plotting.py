@@ -1,3 +1,5 @@
+"""Plotting helpers for spike and population visualizations."""
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -12,50 +14,48 @@ def plot_spike_raster(
     ylabel="Neuron",
     ax=None,
 ):
-    """Plot spike raster for a single trial of multi-neuron population response.
+    """Plot a single-trial spike raster for a multi-neuron TsGroup.
+
+    Draws one horizontal row per neuron with vertical tick marks at spike
+    times, restricted to one trial interval from ``tsgroup.time_support``.
+    Times are shown relative to trial onset (0 to trial duration). Intended
+    for quick inspection of population spike patterns from
+    :class:`~neurostatsmodels.populations.GaussianTunedPopulation` or other
+    pynapple TsGroups with trial epochs.
 
     Parameters
     ----------
     tsgroup : nap.TsGroup
-        TsGroup containing spike times for all neurons. Trial epochs are
-        extracted from the time_support attribute.
+        Spike times for all neurons. Trial epochs come from ``time_support``.
     trial_idx : int or None, optional
-        Which trial to plot. If None and there is only one trial, plots that trial.
-        If None and there are multiple trials, defaults to 0. Default is None.
+        Which trial to plot. If None, uses trial 0. Default is None.
     neuron_labels : list of str, optional
-        Labels for each neuron. If None, uses indices 0, 1, 2, ...
+        Y-axis labels for each neuron. If None, uses neuron indices.
     figsize : tuple, optional
-        Figure size (width, height). If None, auto-computed based on data.
+        Figure size ``(width, height)``. If None, height scales with neuron count.
     title : str, optional
-        Plot title.
+        Axes title.
     xlabel : str, optional
-        X-axis label. Default is 'Time (s)'.
+        X-axis label. Default is ``'Time (s)'``.
     ylabel : str, optional
-        Y-axis label. Default is 'Neuron'.
+        Y-axis label. Default is ``'Neuron'``.
     ax : matplotlib.axes.Axes, optional
-        Axes to plot on. If None, creates new figure.
+        Axes to draw on. If None, creates a new figure.
 
     Returns
     -------
     fig : matplotlib.figure.Figure
-        Figure object.
+        Figure containing the raster.
     ax : matplotlib.axes.Axes
-        Axes object.
+        Axes with the raster.
 
     Examples
     --------
-    >>> # Create population and generate spikes
     >>> pop = GaussianTunedPopulation(n_neurons=10, max_rate=50.0)
     >>> pop.set_means_uniform(np.linspace(-200, 200, 100))
     >>> pop.set_sigmas(50.0)
-    >>>
-    >>> # Generate spikes with multiple trials
     >>> spikes = pop.generate_spikes(0.0, duration=1.0, n_trials=5)
     >>> fig, ax = plot_spike_raster(spikes, trial_idx=0)
-    >>>
-    >>> # Generate spikes with single trial
-    >>> spikes = pop.generate_spikes(0.0, duration=1.0, n_trials=1)
-    >>> fig, ax = plot_spike_raster(spikes)  # trial_idx not needed
     """
     # Get trial interval
     trial_epochs = tsgroup.time_support

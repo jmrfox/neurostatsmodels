@@ -1,3 +1,9 @@
+"""Reusable computational neuroscience models and analysis utilities.
+
+Library code for the toy projects in this repo lives here. Notebooks and
+scripts should import from this package rather than duplicating shared logic.
+"""
+
 from .integration import (
     Integrator,
     IntegratorOptions,

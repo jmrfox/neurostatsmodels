@@ -1,3 +1,12 @@
+"""Synaptic integration toy model and batch signal-complexity analyses.
+
+``Integrator`` simulates multi-synapse dendritic/voltage responses with
+optional saturation nonlinearity, for exploring how morphology filters and
+input statistics shape temporal structure. ``BatchSignalAnalyzer`` and
+``NonnegativeBatchSignalAnalyzer`` compare two trial×time ensembles with
+entropy, dimensionality, compression, and NMF-based metrics.
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
@@ -9,6 +18,29 @@ from tqdm import tqdm
 
 
 def make_epoch_times(total_time=500.0, n_epochs=3, buffer_fraction=0.1):
+    """Partition a trial into contiguous active epochs with edge buffers.
+
+    Leaves a fraction of ``total_time`` quiet at the start and end, then splits
+    the remaining middle into ``n_epochs`` equal intervals. Used by
+    :class:`Integrator` so Poisson drive is piecewise-stationary within epochs
+    rather than spanning the entire trial.
+
+    Parameters
+    ----------
+    total_time : float, optional
+        Full trial duration (same units as returned edges; typically ms).
+        Default is 500.0.
+    n_epochs : int, optional
+        Number of equal-length active epochs. Default is 3.
+    buffer_fraction : float, optional
+        Fraction of ``total_time`` reserved as buffer on each side.
+        Default is 0.1 (10% start + 10% end).
+
+    Returns
+    -------
+    list of tuple of float
+        ``(start, end)`` pairs for each epoch, length ``n_epochs``.
+    """
     buffer_time = total_time * buffer_fraction
     epoch_time = (total_time - 2 * buffer_time) / n_epochs
     return [
@@ -19,6 +51,48 @@ def make_epoch_times(total_time=500.0, n_epochs=3, buffer_fraction=0.1):
 
 @dataclass
 class IntegratorOptions:
+    """Configuration for :class:`Integrator` simulations.
+
+    Groups timing, synapse count/rate statistics, morphology filter ranges,
+    Dirichlet rate allocation, and nonlinearity into one object so experiments
+    can be varied without long argument lists.
+
+    Attributes
+    ----------
+    total_time_ms : float
+        Trial duration in ms.
+    time_step_ms : float
+        Simulation time step in ms.
+    n_trials : int
+        Number of trials in :meth:`Integrator.run_trials`.
+    n_epochs : int
+        Number of active rate epochs per trial.
+    buffer_fraction : float
+        Quiet fraction at each end of the trial (see :func:`make_epoch_times`).
+    n_synapses : int
+        Number of input synapses / pathways.
+    synapse_tau_ms : float
+        Alpha (AMPA-like) synaptic time constant in ms.
+    total_rate_hz : float
+        Total Poisson rate (Hz) distributed across active synapses per epoch.
+    active_synapse_fraction : float or str
+        Fraction of synapses active each trial, or ``'random'`` to draw the
+        count uniformly each call to rate generation.
+    morphology_tau_range : tuple of float
+        ``(min, max)`` exponential morphology filter time constants (ms).
+    morphology_amplitude_range : tuple of float
+        ``(min, max)`` synaptic amplitude scales.
+    sampling_method : str
+        How to assign morphology params: ``'uniform'`` or ``'linspace'``.
+    dirichlet_alpha : float
+        Concentration for Dirichlet weights that split ``total_rate_hz`` across
+        active synapses (smaller → more uneven allocation).
+    nonlinear : bool
+        If True, apply a saturating transform to the summed voltage.
+    random_seed : int
+        Seed for the integrator RNG.
+    """
+
     total_time_ms: float = 500.0
     time_step_ms: float = 0.1
     n_trials: int = 100
@@ -48,8 +122,35 @@ class IntegratorOptions:
 
 
 class Integrator:
+    """Multi-synapse filtered Poisson drive → voltage-like trial traces.
+
+    Generative picture per trial:
+
+    1. Choose a subset of active synapses and, within each epoch, allocate
+       ``total_rate_hz`` across them with a Dirichlet draw.
+    2. Draw independent Poisson spike trains from those piecewise rates.
+    3. Filter each train with synapse alpha ⊗ morphology exponential, scale
+       by amplitude, and sum.
+    4. Optionally apply a saturating nonlinearity.
+
+    Morphological diversity (τ and amplitude ranges) controls how heterogeneous
+    the effective kernels are—central for studying temporal integration and
+    signal complexity across conditions.
+
+    Parameters
+    ----------
+    options : IntegratorOptions
+        Full simulation configuration.
+    """
 
     def __init__(self, options: IntegratorOptions):
+        """Build kernels, sample morphology parameters, and cache time axes.
+
+        Parameters
+        ----------
+        options : IntegratorOptions
+            Simulation settings (seed, rates, morphology ranges, etc.).
+        """
         self.opts = options
         self.rng = np.random.default_rng(self.opts.random_seed)
         self.n_time_steps = int(self.opts.total_time_ms / self.opts.time_step_ms)
@@ -70,6 +171,13 @@ class Integrator:
 
     # alpha synapse kernel
     def _create_alpha_kernel(self):
+        """Return a peak-normalized alpha synaptic kernel on ``kernel_time``.
+
+        Returns
+        -------
+        ndarray
+            Alpha waveform ``(t/τ) exp(1 - t/τ)`` with τ = ``synapse_tau_ms``.
+        """
         t = self.kernel_time
         tau = self.opts.synapse_tau_ms
         kernel = (t / tau) * np.exp(1 - t / tau)
@@ -78,15 +186,50 @@ class Integrator:
 
     # morphology kernel
     def _create_morphology_kernel(self, tau_ms):
+        """Return a unit-peak exponential dendritic/morphology filter.
+
+        Parameters
+        ----------
+        tau_ms : float
+            Decay time constant in ms.
+
+        Returns
+        -------
+        ndarray
+            ``exp(-t / tau_ms)`` on ``kernel_time``.
+        """
         return np.exp(-self.kernel_time / tau_ms)
 
     def _create_combined_kernel(self, tau_ms):
+        """Convolve synaptic alpha with morphology exponential for one synapse.
+
+        Parameters
+        ----------
+        tau_ms : float
+            Morphology time constant in ms.
+
+        Returns
+        -------
+        ndarray
+            Combined kernel truncated to ``len(kernel_time)``.
+        """
         morph_kernel = self._create_morphology_kernel(tau_ms)
         combined = np.convolve(self.alpha_kernel, morph_kernel)
         return combined[: len(self.kernel_time)]
 
     # Input generation
     def _generate_rate_matrix(self):
+        """Sample piecewise-constant Poisson rates for all synapses.
+
+        Within each epoch, active synapses share ``total_rate_hz`` via a
+        Dirichlet draw (concentration ``dirichlet_alpha``). Inactive synapses
+        remain at zero.
+
+        Returns
+        -------
+        ndarray, shape (n_synapses, n_time_steps)
+            Instantaneous rates in Hz.
+        """
         rates = np.zeros((self.opts.n_synapses, self.n_time_steps))
         if self.opts.active_synapse_fraction == "random":
             n_active = self.rng.integers(low=1, high=self.opts.n_synapses)
@@ -107,10 +250,34 @@ class Integrator:
         return rates
 
     def _generate_poisson_spikes(self, rate_trace):
+        """Bernoulli approximation to an inhomogeneous Poisson spike train.
+
+        Parameters
+        ----------
+        rate_trace : ndarray
+            Rate in Hz at each time step.
+
+        Returns
+        -------
+        ndarray
+            Binary spike indicators (0/1) of the same length.
+        """
         probability = rate_trace * self.opts.time_step_ms / 1000.0
         return (self.rng.random(len(rate_trace)) < probability).astype(float)
 
     def _sample_amplitudes(self, method="uniform"):
+        """Sample per-synapse morphology amplitudes from the configured range.
+
+        Parameters
+        ----------
+        method : {'uniform', 'linspace'}, optional
+            Random draws vs evenly spaced values across synapses.
+
+        Returns
+        -------
+        ndarray, shape (n_synapses,)
+            Amplitude scales.
+        """
         a0, a1 = self.opts.morphology_amplitude_range
         if method == "uniform":
             samples = self.rng.uniform(low=a0, high=a1, size=self.opts.n_synapses)
@@ -121,6 +288,18 @@ class Integrator:
         return samples
 
     def _sample_time_contants(self, method="uniform"):
+        """Sample per-synapse morphology time constants from the configured range.
+
+        Parameters
+        ----------
+        method : {'uniform', 'linspace'}, optional
+            Random draws vs evenly spaced values across synapses.
+
+        Returns
+        -------
+        ndarray, shape (n_synapses,)
+            Morphology τ values in ms.
+        """
         t0, t1 = self.opts.morphology_tau_range
         if method == "uniform":
             samples = self.rng.uniform(low=t0, high=t1, size=self.opts.n_synapses)
@@ -132,6 +311,13 @@ class Integrator:
 
     # Simulation core
     def simulate_single_trial(self):
+        """Simulate one summed voltage-like trace from filtered synaptic spikes.
+
+        Returns
+        -------
+        ndarray, shape (n_time_steps,)
+            Trial waveform (linear sum, optionally nonlinearly saturated).
+        """
         amplitudes = self.morphology_amplitudes
         tau_filters = self.morphology_time_constants
         rate_matrix = self._generate_rate_matrix()
@@ -148,6 +334,21 @@ class Integrator:
         return output_voltage
 
     def run_trials(self, per_trial_normalization=None):
+        """Simulate many trials and optionally normalize each waveform.
+
+        Retries a trial if its L2 norm is near zero (empty/silent draws).
+
+        Parameters
+        ----------
+        per_trial_normalization : str or None, optional
+            None (raw), ``'divide_by_norm'``, ``'divide_by_max'``,
+            ``'divide_by_mean'``, or ``'unit_gaussian'`` (z-score each trial).
+
+        Returns
+        -------
+        ndarray, shape (n_trials, n_time_steps)
+            Trial ensemble.
+        """
         results = np.zeros((self.opts.n_trials, self.n_time_steps))
         for trial_index in tqdm(range(self.opts.n_trials)):
             while np.linalg.norm(results[trial_index]) < 1e-6:
@@ -172,6 +373,23 @@ class Integrator:
     # -------------------------------------------------------
 
     def compute_participation_ratio(self, data_matrix):
+        """Participation ratio of a trial×feature matrix via singular values.
+
+        ``PR = (sum s_i)^2 / sum s_i^2`` after centering columns. Higher values
+        indicate variance spread across more modes (effective dimensionality).
+
+        Parameters
+        ----------
+        data_matrix : ndarray
+            Typically shape ``(n_trials, n_time_steps)``.
+
+        Returns
+        -------
+        participation_ratio : float
+            Scalar effective dimensionality.
+        singular_values : ndarray
+            Singular values of the centered matrix.
+        """
         centered = data_matrix - data_matrix.mean(axis=0)
         _, singular_values, _ = np.linalg.svd(centered, full_matrices=False)
         participation_ratio = (np.sum(singular_values) ** 2) / np.sum(
@@ -181,9 +399,27 @@ class Integrator:
 
 
 class BatchSignalAnalyzer:
+    """Compare complexity / geometry of two centered trial×time ensembles.
+
+    Holds conditions ``Y_A`` and ``Y_B`` (same shape), column-centers them, and
+    exposes paired metrics: kNN entropy, spectral (PCA) entropy, compression,
+    intrinsic dimension, pairwise distances, and power-spectrum entropy.
+    Intended for asking whether one generative regime produces richer or more
+    compressible temporal signals than another.
+
+    Parameters
+    ----------
+    Y_A, Y_B : ndarray, shape (n_trials, n_timepoints)
+        Trial ensembles to compare (must match in shape).
+    """
+
     def __init__(self, Y_A, Y_B):
-        """
-        Y_A, Y_B: arrays of shape (num_trials, num_timepoints)
+        """Store copies of both ensembles and subtract per-timepoint means.
+
+        Parameters
+        ----------
+        Y_A, Y_B : ndarray, shape (n_trials, n_timepoints)
+            Input trial matrices (identical shapes required).
         """
         assert Y_A.shape == Y_B.shape, "Inputs must have same shape"
         self.Y_A = Y_A.copy()
@@ -198,12 +434,42 @@ class BatchSignalAnalyzer:
     # ==========================================================
 
     def knn_entropy(self, Y, k=5):
+        """Proxy for differential entropy via mean log kNN distance.
+
+        Larger values suggest a more spread / diverse cloud of trial vectors
+        in time-series space (Kozachenko–Leonenko-style estimator, up to
+        additive constants not computed here).
+
+        Parameters
+        ----------
+        Y : ndarray, shape (n_trials, n_features)
+            Points (trials) in feature space.
+        k : int, optional
+            Neighbor index used for the distance (excluding self). Default 5.
+
+        Returns
+        -------
+        float
+            Mean ``log(r_k + eps)`` over trials.
+        """
         nbrs = NearestNeighbors(n_neighbors=k + 1).fit(Y)
         distances, _ = nbrs.kneighbors(Y)
         r = distances[:, -1]
         return np.mean(np.log(r + 1e-12))
 
     def compare_knn_entropy(self, k=5):
+        """kNN entropy for conditions A and B.
+
+        Parameters
+        ----------
+        k : int, optional
+            Neighbor count for the estimator. Default is 5.
+
+        Returns
+        -------
+        dict
+            ``{'A': float, 'B': float}``.
+        """
         return {"A": self.knn_entropy(self.Y_A, k), "B": self.knn_entropy(self.Y_B, k)}
 
     # ==========================================================
@@ -211,12 +477,34 @@ class BatchSignalAnalyzer:
     # ==========================================================
 
     def spectral_entropy(self, Y):
+        """Entropy of normalized singular-value power (PCA spectrum flatness).
+
+        Higher values mean energy is distributed across more modes rather than
+        concentrated in a few principal components.
+
+        Parameters
+        ----------
+        Y : ndarray
+            Trial×feature matrix.
+
+        Returns
+        -------
+        float
+            ``-sum p log p`` with ``p`` proportional to ``s_i^2``.
+        """
         U, S, Vt = np.linalg.svd(Y, full_matrices=False)
         power = S**2
         p = power / np.sum(power)
         return -np.sum(p * np.log(p + 1e-12))
 
     def compare_spectral_entropy(self):
+        """Spectral entropy for conditions A and B.
+
+        Returns
+        -------
+        dict
+            ``{'A': float, 'B': float}``.
+        """
         return {
             "A": self.spectral_entropy(self.Y_A),
             "B": self.spectral_entropy(self.Y_B),
@@ -227,6 +515,21 @@ class BatchSignalAnalyzer:
     # ==========================================================
 
     def compression_ratio(self, Y):
+        """Mean zlib compressed/raw size after 8-bit scaling of each trial.
+
+        Higher ratio ⇒ less compressible ⇒ more algorithmic complexity / less
+        repetitive temporal structure (heuristic).
+
+        Parameters
+        ----------
+        Y : ndarray, shape (n_trials, n_timepoints)
+            Trial waveforms.
+
+        Returns
+        -------
+        float
+            Average compression ratio across trials.
+        """
         ratios = []
         for trial in Y:
             # normalize to 8-bit for stable compression
@@ -237,6 +540,13 @@ class BatchSignalAnalyzer:
         return np.mean(ratios)
 
     def compare_compression(self):
+        """Compression ratios for conditions A and B.
+
+        Returns
+        -------
+        dict
+            ``{'A': float, 'B': float}``.
+        """
         return {
             "A": self.compression_ratio(self.Y_A),
             "B": self.compression_ratio(self.Y_B),
@@ -247,10 +557,39 @@ class BatchSignalAnalyzer:
     # ==========================================================
 
     def participation_ratio(self, Y):
+        """SVD participation ratio of ``Y`` (no extra centering).
+
+        Parameters
+        ----------
+        Y : ndarray
+            Trial×feature matrix (already centered in ``__init__`` for A/B).
+
+        Returns
+        -------
+        float
+            ``(sum s)^2 / sum s^2``.
+        """
         _, S, _ = np.linalg.svd(Y, full_matrices=False)
         return (np.sum(S) ** 2) / np.sum(S**2)
 
     def levina_bickel_dimension(self, Y, k=10):
+        """Local intrinsic dimension via the Levina–Bickel MLE.
+
+        Estimates manifold dimension from ratios of kNN distances in trial
+        space—complementary to global participation ratio.
+
+        Parameters
+        ----------
+        Y : ndarray, shape (n_trials, n_features)
+            Points to embed.
+        k : int, optional
+            Number of neighbors (excluding self). Default is 10.
+
+        Returns
+        -------
+        float
+            Mean local dimension estimate over trials.
+        """
         nbrs = NearestNeighbors(n_neighbors=k + 1).fit(Y)
         distances, _ = nbrs.kneighbors(Y)
 
@@ -262,6 +601,13 @@ class BatchSignalAnalyzer:
         return np.mean(d)
 
     def compare_intrinsic_dimension(self):
+        """Participation ratio and Levina–Bickel dimension for A and B.
+
+        Returns
+        -------
+        dict
+            Keys ``PR_A``, ``PR_B``, ``LB_A``, ``LB_B``.
+        """
         return {
             "PR_A": self.participation_ratio(self.Y_A),
             "PR_B": self.participation_ratio(self.Y_B),
@@ -274,12 +620,33 @@ class BatchSignalAnalyzer:
     # ==========================================================
 
     def pairwise_distances(self, Y):
+        """Mean and std of pairwise Euclidean distances between trials.
+
+        Summarizes how spread out trial waveforms are in time-series space.
+
+        Parameters
+        ----------
+        Y : ndarray, shape (n_trials, n_features)
+            Trial vectors.
+
+        Returns
+        -------
+        dict
+            ``{'mean': float, 'std': float}``.
+        """
         from scipy.spatial.distance import pdist
 
         d = pdist(Y, metric="euclidean")
         return {"mean": np.mean(d), "std": np.std(d)}
 
     def compare_distances(self):
+        """Pairwise distance stats for conditions A and B.
+
+        Returns
+        -------
+        dict
+            ``{'A': {...}, 'B': {...}}`` with mean/std each.
+        """
         return {
             "A": self.pairwise_distances(self.Y_A),
             "B": self.pairwise_distances(self.Y_B),
@@ -290,6 +657,20 @@ class BatchSignalAnalyzer:
     # ==========================================================
 
     def power_spectrum_entropy(self, Y):
+        """Mean Shannon entropy of each trial's normalized FFT power spectrum.
+
+        Higher values indicate richer / flatter frequency content across trials.
+
+        Parameters
+        ----------
+        Y : ndarray, shape (n_trials, n_timepoints)
+            Trial waveforms.
+
+        Returns
+        -------
+        float
+            Average spectral entropy over trials.
+        """
         entropies = []
         for trial in Y:
             spectrum = np.abs(rfft(trial)) ** 2
@@ -298,6 +679,13 @@ class BatchSignalAnalyzer:
         return np.mean(entropies)
 
     def compare_power_entropy(self):
+        """Power-spectrum entropy for conditions A and B.
+
+        Returns
+        -------
+        dict
+            ``{'A': float, 'B': float}``.
+        """
         return {
             "A": self.power_spectrum_entropy(self.Y_A),
             "B": self.power_spectrum_entropy(self.Y_B),
@@ -308,6 +696,14 @@ class BatchSignalAnalyzer:
     # ==========================================================
 
     def run_all(self):
+        """Run all pairwise comparison metrics and return a nested dict.
+
+        Returns
+        -------
+        dict
+            Keys: ``knn_entropy``, ``spectral_entropy``, ``compression``,
+            ``intrinsic_dimension``, ``pairwise_distances``, ``power_entropy``.
+        """
         return {
             "knn_entropy": self.compare_knn_entropy(),
             "spectral_entropy": self.compare_spectral_entropy(),
@@ -318,6 +714,12 @@ class BatchSignalAnalyzer:
         }
 
     def run_all_print(self):
+        """Compute :meth:`run_all` and print human-readable interpretations.
+
+        Returns
+        -------
+        None
+        """
         results = self.run_all()
         print("\n--- kNN Entropy:")
         print("\tdistribution complexity. higher -> more diverse signals")
@@ -351,11 +753,30 @@ class BatchSignalAnalyzer:
 
 
 class NonnegativeBatchSignalAnalyzer:
+    """Compare two nonnegative trial×time ensembles with NMF-aware metrics.
+
+    Unlike :class:`BatchSignalAnalyzer`, preserves nonnegativity (optional
+    per-trial max normalization) and emphasizes additive parts-based structure
+    via NMF participation ratio, reconstruction curves, and Hoyer sparsity,
+    plus kNN entropy, compression, and PCA PR as a reference.
+
+    Parameters
+    ----------
+    Y_A, Y_B : ndarray, shape (n_trials, n_timepoints)
+        Nonnegative trial ensembles (same shape).
+    normalize : bool, optional
+        If True, shift/scale each trial to ``[0, 1]``. Default is True.
+    """
 
     def __init__(self, Y_A, Y_B, normalize=True):
-        """
-        Y_A, Y_B: (num_trials, num_timepoints), assumed non-negative
-        normalize: if True, normalize each trace to unit max
+        """Copy ensembles and optionally normalize each trial to unit max.
+
+        Parameters
+        ----------
+        Y_A, Y_B : ndarray, shape (n_trials, n_timepoints)
+            Nonnegative trial matrices.
+        normalize : bool, optional
+            Apply :meth:`_normalize` to both. Default is True.
         """
 
         assert Y_A.shape == Y_B.shape
@@ -372,6 +793,18 @@ class NonnegativeBatchSignalAnalyzer:
     # ==========================================================
 
     def _normalize(self, Y):
+        """Shift each trial to min 0 and scale so max is 1.
+
+        Parameters
+        ----------
+        Y : ndarray, shape (n_trials, n_timepoints)
+            Input ensemble.
+
+        Returns
+        -------
+        ndarray
+            Per-trial normalized copy.
+        """
         Y = Y - Y.min(axis=1, keepdims=True)
         Y = Y / (Y.max(axis=1, keepdims=True) + 1e-12)
         return Y
@@ -381,19 +814,47 @@ class NonnegativeBatchSignalAnalyzer:
     # ==========================================================
 
     def _hoyer_sparsity(self, x):
+        """Hoyer sparsity of a vector (0 = dense, 1 = maximally sparse).
+
+        Parameters
+        ----------
+        x : ndarray
+            Nonnegative (or absolute-valued in L1/L2) component loadings.
+
+        Returns
+        -------
+        float
+            Sparsity in ``[0, 1]``.
+        """
         n = len(x)
         l1 = np.sum(np.abs(x))
         l2 = np.sqrt(np.sum(x**2))
         return (np.sqrt(n) - l1 / l2) / (np.sqrt(n) - 1)
 
     def nmf_analysis(self, Y, n_components=10, max_components=15, max_iter=500):
-        """
-        Unified NMF analysis that computes all three metrics efficiently:
-        - Participation ratio
-        - Reconstruction curve
-        - Sparsity (Hoyer metric)
+        """Fit NMF and summarize additive structure of an ensemble.
 
-        Returns a dictionary with all three metrics.
+        Computes (1) reconstruction error vs number of components, (2)
+        energy-based participation ratio across components, and (3) mean Hoyer
+        sparsity of temporal motifs ``H``. Useful when signals are nonnegative
+        and one cares about localized additive motifs rather than signed PCA.
+
+        Parameters
+        ----------
+        Y : ndarray, shape (n_trials, n_timepoints)
+            Nonnegative data matrix.
+        n_components : int, optional
+            Components for PR and sparsity. Default is 10.
+        max_components : int, optional
+            Max ``k`` for the reconstruction curve. Default is 15.
+        max_iter : int, optional
+            NMF max iterations. Default is 500.
+
+        Returns
+        -------
+        dict
+            ``reconstruction_curve``, ``participation_ratio``,
+            ``energy_distribution``, ``sparsity``.
         """
         results = {}
 
@@ -443,8 +904,22 @@ class NonnegativeBatchSignalAnalyzer:
         return results
 
     def compare_nmf_analysis(self, n_components=10, max_components=15, max_iter=500):
-        """
-        Compare all NMF metrics between Y_A and Y_B in a single call.
+        """Run :meth:`nmf_analysis` on A and B and return side-by-side metrics.
+
+        Parameters
+        ----------
+        n_components : int, optional
+            Components for PR/sparsity. Default is 10.
+        max_components : int, optional
+            Max components for reconstruction curves. Default is 15.
+        max_iter : int, optional
+            NMF iterations. Default is 500.
+
+        Returns
+        -------
+        dict
+            Nested dicts for ``participation_ratio``, ``reconstruction_curve``,
+            and ``sparsity``, each with ``A`` / ``B`` entries.
         """
         results_A = self.nmf_analysis(self.Y_A, n_components, max_components, max_iter)
         results_B = self.nmf_analysis(self.Y_B, n_components, max_components, max_iter)
@@ -509,12 +984,38 @@ class NonnegativeBatchSignalAnalyzer:
     # ==========================================================
 
     def knn_entropy(self, Y, k=5):
+        """kNN entropy proxy (see :meth:`BatchSignalAnalyzer.knn_entropy`).
+
+        Parameters
+        ----------
+        Y : ndarray
+            Trial×feature matrix.
+        k : int, optional
+            Neighbor index. Default is 5.
+
+        Returns
+        -------
+        float
+            Mean log kNN distance.
+        """
         nbrs = NearestNeighbors(n_neighbors=k + 1).fit(Y)
         distances, _ = nbrs.kneighbors(Y)
         r = distances[:, -1]
         return np.mean(np.log(r + 1e-12))
 
     def compare_knn_entropy(self, k=5):
+        """kNN entropy for conditions A and B.
+
+        Parameters
+        ----------
+        k : int, optional
+            Neighbor count. Default is 5.
+
+        Returns
+        -------
+        dict
+            ``{'A': float, 'B': float}``.
+        """
         return {"A": self.knn_entropy(self.Y_A, k), "B": self.knn_entropy(self.Y_B, k)}
 
     # ==========================================================
@@ -522,6 +1023,18 @@ class NonnegativeBatchSignalAnalyzer:
     # ==========================================================
 
     def compression_ratio(self, Y):
+        """Mean zlib ratio after mapping trials to 8-bit (assumes ~[0, 1] scale).
+
+        Parameters
+        ----------
+        Y : ndarray, shape (n_trials, n_timepoints)
+            Typically already normalized trials.
+
+        Returns
+        -------
+        float
+            Average compressed/raw size ratio.
+        """
 
         ratios = []
 
@@ -534,6 +1047,13 @@ class NonnegativeBatchSignalAnalyzer:
         return np.mean(ratios)
 
     def compare_compression(self):
+        """Compression ratios for conditions A and B.
+
+        Returns
+        -------
+        dict
+            ``{'A': float, 'B': float}``.
+        """
         return {
             "A": self.compression_ratio(self.Y_A),
             "B": self.compression_ratio(self.Y_B),
@@ -544,6 +1064,21 @@ class NonnegativeBatchSignalAnalyzer:
     # ==========================================================
 
     def pca_participation_ratio(self, Y):
+        """Column-centered SVD participation ratio (signed / variance-based).
+
+        Provided as a reference alongside NMF metrics; does not respect
+        nonnegativity of the generative model.
+
+        Parameters
+        ----------
+        Y : ndarray
+            Trial×feature matrix.
+
+        Returns
+        -------
+        float
+            Participation ratio of singular values.
+        """
 
         Yc = Y - Y.mean(axis=0)
         _, S, _ = np.linalg.svd(Yc, full_matrices=False)
@@ -551,6 +1086,13 @@ class NonnegativeBatchSignalAnalyzer:
         return (np.sum(S) ** 2) / np.sum(S**2)
 
     def compare_pca(self):
+        """PCA participation ratio for conditions A and B.
+
+        Returns
+        -------
+        dict
+            ``{'A': float, 'B': float}``.
+        """
         return {
             "A": self.pca_participation_ratio(self.Y_A),
             "B": self.pca_participation_ratio(self.Y_B),
@@ -561,6 +1103,21 @@ class NonnegativeBatchSignalAnalyzer:
     # ==========================================================
 
     def run_all(self, n_components=10, max_iter=500):
+        """Run NMF, kNN, compression, and PCA comparisons.
+
+        Parameters
+        ----------
+        n_components : int, optional
+            NMF rank for PR/sparsity/reconstruction. Default is 10.
+        max_iter : int, optional
+            NMF iterations. Default is 500.
+
+        Returns
+        -------
+        dict
+            ``nmf_pr``, ``nmf_rec``, ``nmf_sparsity``, ``knn_entropy``,
+            ``compression``, ``pca_pr``.
+        """
         nmf_results = self.compare_nmf_analysis(
             n_components=n_components, max_components=n_components, max_iter=max_iter
         )
@@ -575,6 +1132,19 @@ class NonnegativeBatchSignalAnalyzer:
         }
 
     def run_all_print(self, n_components=10, max_iter=500):
+        """Compute :meth:`run_all` and print annotated summaries.
+
+        Parameters
+        ----------
+        n_components : int, optional
+            Passed to :meth:`run_all`. Default is 10.
+        max_iter : int, optional
+            Passed to :meth:`run_all`. Default is 500.
+
+        Returns
+        -------
+        None
+        """
         results = self.run_all(n_components=n_components, max_iter=max_iter)
 
         print("\n--- NMF Participation Ratio:")

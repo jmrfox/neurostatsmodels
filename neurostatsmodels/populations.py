@@ -1,25 +1,52 @@
-# Population-related models and utilities
+"""Gaussian-tuned population codes, Fisher information, and spike generation.
+
+Supports classic efficient-coding / sensory-coding toy models: neurons with
+Gaussian tuning curves over a 1D stimulus, analytic-style Fisher information,
+inhomogeneous Poisson (time-stepped) spike generation with optional global
+gain suppression, and simple maximum-likelihood decoding.
+"""
+
 import numpy as np
 import pynapple as nap
 
 
 class GaussianTunedPopulation:
-    """Population of neurons with Gaussian tuning curves.
+    """Population of neurons with Gaussian tuning curves over a 1D stimulus.
 
-    Each neuron has a tuning curve r(s) = max_rate * exp(-0.5 * ((s - mean) / sigma)^2)
-    where s is the stimulus value, and max_rate = reference_rate * (reference_sigma / sigma).
+    Each neuron ``i`` has preferred value ``mean_i`` and width ``sigma_i``:
+
+    ``r_i(s) = max_rate_i * exp(-0.5 * ((s - mean_i) / sigma_i)^2) + spontaneous_i``
+
+    where ``max_rate_i = reference_rate * (reference_sigma / sigma_i)``. Narrower
+    tunings therefore get higher peak rates under the default resource tradeoff
+    (area under the tuning curve is roughly conserved with width).
+
+    Typical workflow: set means/sigmas → optionally build cached tuning / FI
+    curves → compute rates or Fisher information → generate spikes → decode.
 
     Parameters
     ----------
     n_neurons : int
-        Number of neurons in the population
-    reference_rate : float
-        Reference firing rate in Hz. Used to compute max_rate for each neuron.
-    reference_sigma : float
-        Reference tuning width. Used to compute max_rate for each neuron.
+        Number of neurons in the population.
+    reference_rate : float, optional
+        Reference peak rate in Hz used to set ``max_rate`` from sigma.
+        Default is 100.0.
+    reference_sigma : float, optional
+        Reference tuning width paired with ``reference_rate``. Default is 50.0.
     """
 
     def __init__(self, n_neurons, reference_rate=100.0, reference_sigma=50.0):
+        """Initialize an empty population (tuning parameters unset until setters).
+
+        Parameters
+        ----------
+        n_neurons : int
+            Number of neurons.
+        reference_rate : float, optional
+            Reference peak rate in Hz. Default is 100.0.
+        reference_sigma : float, optional
+            Reference tuning width. Default is 50.0.
+        """
         self.n_neurons = n_neurons
         self.reference_rate = reference_rate
         self.reference_sigma = reference_sigma
@@ -34,24 +61,28 @@ class GaussianTunedPopulation:
         self.fisher_info_curves = None
 
     def set_means(self, means):
-        """Set the preferred stimulus values (means) for each neuron.
+        """Set preferred stimulus values (tuning-curve centers) for each neuron.
 
         Parameters
         ----------
         means : array-like
-            Preferred stimulus values. Must have length n_neurons.
+            Preferred stimulus values. Must have length ``n_neurons``.
         """
         self.means = np.asarray(means, dtype=float)
         if len(self.means) != self.n_neurons:
             raise ValueError(f"means must have length {self.n_neurons}")
 
     def set_means_uniform(self, stimulus_values):
-        """Set means uniformly distributed over given stimulus values.
+        """Place preferred means evenly across a stimulus grid.
+
+        Selects ``n_neurons`` indices via linspace over ``stimulus_values`` so
+        coverage of the stimulus range is approximately uniform—standard for
+        homogeneous population-code demos.
 
         Parameters
         ----------
         stimulus_values : array-like
-            Grid of stimulus values to distribute means over.
+            Grid of stimulus values to sample means from (length ≥ n_neurons).
         """
         stimulus_values = np.asarray(stimulus_values)
         if len(stimulus_values) < self.n_neurons:
@@ -61,13 +92,16 @@ class GaussianTunedPopulation:
         self.means = stimulus_values[indices]
 
     def set_sigmas(self, sigmas):
-        """Set the tuning curve widths (standard deviations) for each neuron.
+        """Set tuning widths (Gaussian standard deviations) for each neuron.
+
+        Narrower ``sigma`` increases peak rate via the reference_rate/sigma
+        scaling in :meth:`compute_rates`.
 
         Parameters
         ----------
         sigmas : float or array-like
-            Standard deviations. If float, all neurons have the same sigma.
-            If array-like, must have length n_neurons.
+            Standard deviations. A scalar applies to all neurons; an array must
+            have length ``n_neurons``.
         """
         if np.isscalar(sigmas):
             self.sigmas = np.full(self.n_neurons, sigmas, dtype=float)
@@ -77,13 +111,15 @@ class GaussianTunedPopulation:
                 raise ValueError(f"sigmas must have length {self.n_neurons}")
 
     def set_refractory_periods(self, refractory_periods):
-        """Set the refractory periods for each neuron.
+        """Set absolute refractory periods used during spike generation.
+
+        During :meth:`generate_spikes`, a neuron cannot fire again until this
+        many seconds have elapsed since its last spike.
 
         Parameters
         ----------
         refractory_periods : float or array-like
-            Refractory periods in seconds. If float, all neurons have the same
-            refractory period. If array-like, must have length n_neurons.
+            Refractory periods in seconds. Scalar or length ``n_neurons``.
         """
         if np.isscalar(refractory_periods):
             self.refractory_periods = np.full(
@@ -97,13 +133,12 @@ class GaussianTunedPopulation:
                 )
 
     def set_spontaneous_rates(self, spontaneous_rates):
-        """Set the spontaneous (baseline) firing rates for each neuron.
+        """Set baseline (stimulus-independent) firing rates added to tuning.
 
         Parameters
         ----------
         spontaneous_rates : float or array-like
-            Spontaneous firing rates in Hz. If float, all neurons have the same
-            spontaneous rate. If array-like, must have length n_neurons.
+            Spontaneous rates in Hz. Scalar or length ``n_neurons``.
         """
         if np.isscalar(spontaneous_rates):
             self.spontaneous_rates = np.full(
@@ -115,18 +150,22 @@ class GaussianTunedPopulation:
                 raise ValueError(f"spontaneous_rates must have length {self.n_neurons}")
 
     def compute_rates(self, stimulus):
-        """Compute firing rates for all neurons at given stimulus value(s).
+        """Evaluate Gaussian tuning curves at stimulus value(s).
+
+        Applies the peak-rate vs width tradeoff and optional spontaneous rates.
+        Does not use cached curves; for interpolated lookup after
+        :meth:`build_tuning_curves`, use :meth:`get_rates_at`.
 
         Parameters
         ----------
         stimulus : float or array-like
-            Stimulus value(s) to compute rates for.
+            Stimulus value(s).
 
         Returns
         -------
         rates : ndarray
-            If stimulus is scalar: shape (n_neurons,)
-            If stimulus is array: shape (n_neurons, n_stimuli)
+            Shape ``(n_neurons,)`` if stimulus is scalar, else
+            ``(n_neurons, n_stimuli)``, in Hz.
         """
         if self.means is None or self.sigmas is None:
             raise ValueError("Must set means and sigmas before computing rates")
@@ -155,15 +194,15 @@ class GaussianTunedPopulation:
         return rates
 
     def build_tuning_curves(self, stimulus_grid):
-        """Precompute and store tuning curves over a stimulus grid as TsdFrame.
+        """Precompute tuning curves on a stimulus grid as a pynapple TsdFrame.
 
-        This method computes the full tuning curves for all neurons and stores them
-        as a pynapple TsdFrame for efficient querying and derivative computation.
+        Stores rates with stimulus as the "time" axis and neurons as columns so
+        downstream methods can interpolate and differentiate efficiently.
 
         Parameters
         ----------
         stimulus_grid : array-like
-            Grid of stimulus values to compute tuning curves over.
+            Stimulus values at which to evaluate all tuning curves.
         """
         self.stimulus_grid = np.asarray(stimulus_grid)
         rates = self.compute_rates(self.stimulus_grid)  # shape: (n_neurons, n_stim)
@@ -171,15 +210,17 @@ class GaussianTunedPopulation:
         self.tuning_curves = nap.TsdFrame(t=self.stimulus_grid, d=rates.T)
 
     def build_fisher_info_curves(self, epsilon=1e-10):
-        """Precompute and store Fisher information curves as TsdFrame.
+        """Precompute per-neuron Fisher information curves from cached tunings.
 
-        This method uses the stored tuning curves to compute Fisher information
-        curves using numerical differentiation. Must call build_tuning_curves first.
+        Uses ``FI(s) = (dr/ds)^2 / (r(s) + epsilon)`` with numerical gradients
+        along the stored stimulus grid. Requires :meth:`build_tuning_curves`.
+        Under independent Poisson assumptions this is the local coding precision
+        contributed by each neuron.
 
         Parameters
         ----------
         epsilon : float, optional
-            Small constant to avoid division by zero. Default is 1e-10.
+            Floor added to rate to avoid division by zero. Default is 1e-10.
         """
         if self.tuning_curves is None or self.stimulus_grid is None:
             raise ValueError("Must call build_tuning_curves before building FI curves")
@@ -197,7 +238,10 @@ class GaussianTunedPopulation:
         self.fisher_info_curves = nap.TsdFrame(t=self.stimulus_grid, d=fi.T)
 
     def get_rates_at(self, stimulus):
-        """Get firing rates at specific stimulus value(s) using stored tuning curves.
+        """Interpolate cached tuning curves at arbitrary stimulus value(s).
+
+        Faster / smoother than re-evaluating the analytic Gaussian when querying
+        many points after :meth:`build_tuning_curves`.
 
         Parameters
         ----------
@@ -207,8 +251,7 @@ class GaussianTunedPopulation:
         Returns
         -------
         rates : ndarray
-            If stimulus is scalar: shape (n_neurons,)
-            If stimulus is array: shape (n_neurons, n_stimuli)
+            Shape ``(n_neurons,)`` or ``(n_neurons, n_stimuli)``, in Hz.
         """
         if self.tuning_curves is None or self.stimulus_grid is None:
             raise ValueError("Must call build_tuning_curves first")
@@ -231,7 +274,9 @@ class GaussianTunedPopulation:
         return rates
 
     def get_fisher_info_at(self, stimulus):
-        """Get Fisher information at specific stimulus value(s) using stored FI curves.
+        """Interpolate cached per-neuron Fisher information at stimulus value(s).
+
+        Requires :meth:`build_fisher_info_curves`.
 
         Parameters
         ----------
@@ -241,8 +286,7 @@ class GaussianTunedPopulation:
         Returns
         -------
         fisher_info : ndarray
-            If stimulus is scalar: shape (n_neurons,)
-            If stimulus is array: shape (n_neurons, n_stimuli)
+            Shape ``(n_neurons,)`` or ``(n_neurons, n_stimuli)``.
         """
         if self.fisher_info_curves is None or self.stimulus_grid is None:
             raise ValueError("Must call build_fisher_info_curves first")
@@ -265,7 +309,10 @@ class GaussianTunedPopulation:
         return fisher_info
 
     def get_population_fisher_info_at(self, stimulus):
-        """Get total population Fisher information at specific stimulus value(s).
+        """Sum of per-neuron Fisher information (independent Poisson population).
+
+        Under independence, total FI adds across neurons and bounds local
+        stimulus discriminability / decoder precision.
 
         Parameters
         ----------
@@ -275,8 +322,7 @@ class GaussianTunedPopulation:
         Returns
         -------
         population_fi : float or ndarray
-            If stimulus is scalar: float
-            If stimulus is array: shape (n_stimuli,)
+            Scalar if stimulus is scalar, else shape ``(n_stimuli,)``.
         """
         fisher_info = self.get_fisher_info_at(stimulus)
 
@@ -537,22 +583,24 @@ class GaussianTunedPopulation:
             return result
 
     def compute_fisher_information(self, stimulus, epsilon=1e-10):
-        """Compute Fisher information for each neuron at given stimulus value(s).
+        """Compute per-neuron Fisher information without using cached curves.
 
-        Fisher information: FI(s) = (dr/ds)^2 / (r(s) + epsilon)
+        ``FI(s) = (dr/ds)^2 / (r(s) + epsilon)`` with ``dr/ds`` from
+        ``np.gradient`` over the provided stimulus array. Prefer this for
+        one-off evaluations; use :meth:`build_fisher_info_curves` for repeated
+        queries on a fixed grid.
 
         Parameters
         ----------
         stimulus : float or array-like
-            Stimulus value(s) to compute FI for.
+            Stimulus value(s).
         epsilon : float, optional
-            Small constant to avoid division by zero. Default is 1e-10.
+            Rate floor to avoid division by zero. Default is 1e-10.
 
         Returns
         -------
         fisher_info : ndarray
-            If stimulus is scalar: shape (n_neurons,)
-            If stimulus is array: shape (n_neurons, n_stimuli)
+            Shape ``(n_neurons,)`` or ``(n_neurons, n_stimuli)``.
         """
         stimulus = np.asarray(stimulus)
         is_scalar = stimulus.ndim == 0
@@ -573,22 +621,19 @@ class GaussianTunedPopulation:
         return fisher_info
 
     def compute_population_fisher_information(self, stimulus, epsilon=1e-10):
-        """Compute total Fisher information across population at given stimulus value(s).
-
-        Total FI is the sum of individual neuron FI values.
+        """Sum of :meth:`compute_fisher_information` over neurons.
 
         Parameters
         ----------
         stimulus : float or array-like
-            Stimulus value(s) to compute population FI for.
+            Stimulus value(s).
         epsilon : float, optional
-            Small constant to avoid division by zero. Default is 1e-10.
+            Passed through to per-neuron FI. Default is 1e-10.
 
         Returns
         -------
         population_fi : float or ndarray
-            If stimulus is scalar: float
-            If stimulus is array: shape (n_stimuli,)
+            Scalar or shape ``(n_stimuli,)``.
         """
         fisher_info = self.compute_fisher_information(stimulus, epsilon=epsilon)
 
@@ -598,25 +643,28 @@ class GaussianTunedPopulation:
         return np.sum(fisher_info, axis=0)
 
     def decode_mle(self, tsgroup, stimulus_range=None):
-        """Decode stimulus using maximum likelihood estimation for each trial.
+        """Maximum-likelihood stimulus decode from spike counts (Poisson model).
 
-        For Poisson neurons, the log-likelihood is:
-        log L(s) = sum_i [n_i * log(r_i(s)) - r_i(s) * T]
-        where n_i is spike count for neuron i, r_i(s) is firing rate, T is duration.
+        For independent Poisson neurons observed for duration ``T``,
+
+        ``log L(s) = sum_i [n_i * log(r_i(s)) - r_i(s) * T]``
+
+        where ``n_i`` is the trial spike count. Searches a 1D stimulus grid and
+        returns the argmax per trial. Ignores timing structure within the trial
+        (rate-code / count-based decoder).
 
         Parameters
         ----------
         tsgroup : nap.TsGroup
-            TsGroup containing spike times for all neurons. Trial epochs are
-            extracted from the time_support attribute.
+            Spike times for all neurons; trials from ``time_support``.
         stimulus_range : tuple, optional
-            (min_stimulus, max_stimulus) to search over. If None, uses the range
-            of the stored tuning curve grid.
+            ``(min, max)`` search range. If None, uses stored ``stimulus_grid``
+            or a range around the neuron means.
 
         Returns
         -------
-        s_mle : ndarray
-            Maximum likelihood estimates, one per trial. Shape: (n_trials,)
+        s_mle : ndarray, shape (n_trials,)
+            MLE stimulus estimate for each trial.
         """
         if self.means is None or self.sigmas is None:
             raise ValueError("Must set means and sigmas before decoding")
