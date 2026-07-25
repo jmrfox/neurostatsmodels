@@ -9,18 +9,23 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "anywidget>=0.11.0",
     "brian2>=2.10.1",
     "ipykernel>=7.1.0",
     "jupytext>=1.19.4",
+    "marimo[recommended]>=0.23.15",
     "matplotlib>=3.10.8",
     "numpy>=2.3.5",
+    "plotly>=6.9.0",
     "pynapple>=0.10.2",
+    "scikit-learn>=1.9.0",
     "scipy>=1.16.3",
     "seaborn>=0.13.2",
     "tqdm>=4.67.1",
+    "wigglystuff>=0.5.21",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["neurostatsmodels*"]
-exclude = ["notebooks*"]
+exclude = ["jupyter*", "marimo*"]
