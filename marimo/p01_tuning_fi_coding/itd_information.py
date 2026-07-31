@@ -15,6 +15,11 @@ def _():
     from wigglystuff import CopyToClipboard, Slider2D
 
     from neurostatsmodels.populations import GaussianTunedPopulation
+    from neurostatsmodels.optimization import (
+        optimize_tuning_width,
+        sweep_tuning_widths,
+        total_average_rate,
+    )
 
     np.set_printoptions(precision=4, suppress=True, linewidth=1000)
     return (
@@ -25,6 +30,9 @@ def _():
         make_subplots,
         mo,
         np,
+        optimize_tuning_width,
+        sweep_tuning_widths,
+        total_average_rate,
     )
 
 
@@ -40,10 +48,10 @@ def _(mo):
       preferred ITDs on $[-200, 200]$ µs
     - Responses are independent Poisson (with refractory period for spikes)
     - Decoder recovers ITD via maximum likelihood
+    - Finally, $\sigma$ is optimized for decoding accuracy under a population
+      firing-rate budget
 
-    Plots use **Plotly** (hover, zoom, toggle traces). Constrained $\sigma$
-    optimization under a rate budget still lives in
-    `jupyter/p01_tuning_fi_coding/`.
+    Plots use **Plotly** (hover, zoom, toggle traces).
     """)
     return
 
@@ -461,11 +469,580 @@ def _(hist_chart, mo):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ### Next steps
+    ## Optimal tuning width under a firing-rate budget
 
-    The jupyter original also sweeps $\sigma$ and runs a constrained COBYLA
-    optimizer under a population rate budget. Port that interactively once the
-    objective evaluation is cheaper (or cached).
+    Narrow tuning sharpens each neuron's slope but leaves gaps in stimulus
+    coverage; broad tuning covers everything but spends spikes on uninformative
+    neurons. With a cap on the population's metabolic cost there is an interior
+    optimum.
+
+    **Objective** (minimize): RMSE of the MLE decoder, estimated by sampling test
+    ITDs, generating trials, and decoding each one.
+
+    **Constraint** (feasible when $\ge 0$):
+
+    $$ \text{slack}(\sigma) = R_{\text{budget}} - \sum_i \overline{r_i(s)} $$
+
+    where $\overline{r_i(s)}$ averages neuron $i$'s rate over the ITD domain.
+
+    The evaluation and optimizer live in
+    [`neurostatsmodels/optimization.py`](../../neurostatsmodels/optimization.py);
+    the cells below just drive them.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### 1. Where is the budget feasible?
+
+    The cost term needs no spikes, so this panel updates instantly. Note that
+    the peak-rate normalization $r_{\max} = r_{\text{ref}}\sigma_{\text{ref}}/\sigma$
+    roughly conserves area under each tuning curve, so cost is only weakly
+    dependent on $\sigma$: the budget mostly limits **neuron count** and
+    **spontaneous rate**, while $\sigma$ is set by the decoding term.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    opt_n_neurons = mo.ui.slider(2, 30, value=10, step=1, label="Neurons")
+    opt_reference_rate = mo.ui.slider(
+        10.0, 150.0, value=50.0, step=5.0, label="Reference peak rate (Hz)"
+    )
+    opt_spontaneous = mo.ui.slider(
+        0.0, 10.0, value=3.0, step=0.5, label="Spontaneous rate (Hz)"
+    )
+    opt_refractory_ms = mo.ui.slider(
+        0.0, 20.0, value=5.0, step=1.0, label="Refractory (ms)"
+    )
+    opt_budget = mo.ui.slider(
+        50.0, 600.0, value=200.0, step=10.0, label="Rate budget (Hz)"
+    )
+    mo.hstack(
+        [
+            opt_n_neurons,
+            opt_reference_rate,
+            opt_spontaneous,
+            opt_refractory_ms,
+            opt_budget,
+        ],
+        wrap=True,
+    )
+    return (
+        opt_budget,
+        opt_n_neurons,
+        opt_reference_rate,
+        opt_refractory_ms,
+        opt_spontaneous,
+    )
+
+
+@app.cell
+def _(
+    GaussianTunedPopulation,
+    np,
+    opt_n_neurons,
+    opt_reference_rate,
+    opt_refractory_ms,
+    opt_spontaneous,
+):
+    opt_grid = np.linspace(-200.0, 200.0, 401)
+    opt_sigma_limits = (5.0, 200.0)
+
+    def make_opt_population():
+        """Fresh population matching the current controls (sigmas set later)."""
+        population = GaussianTunedPopulation(
+            n_neurons=int(opt_n_neurons.value),
+            reference_rate=float(opt_reference_rate.value),
+            reference_sigma=30.0,
+        )
+        population.set_means_uniform(opt_grid)
+        population.set_spontaneous_rates(float(opt_spontaneous.value))
+        population.set_refractory_periods(float(opt_refractory_ms.value) / 1000.0)
+        return population
+
+    return make_opt_population, opt_grid, opt_sigma_limits
+
+
+@app.cell
+def _(
+    go,
+    make_opt_population,
+    mo,
+    np,
+    opt_budget,
+    opt_grid,
+    opt_sigma_limits,
+    total_average_rate,
+):
+    cost_sigmas = np.linspace(opt_sigma_limits[0], opt_sigma_limits[1], 100)
+    cost_pop = make_opt_population()
+    cost_rates = np.array(
+        [total_average_rate(cost_pop, width, opt_grid) for width in cost_sigmas]
+    )
+    cost_budget = float(opt_budget.value)
+    cost_feasible = cost_sigmas[cost_rates <= cost_budget]
+
+    fig_cost = go.Figure()
+    fig_cost.add_trace(
+        go.Scatter(
+            x=cost_sigmas,
+            y=cost_rates,
+            mode="lines",
+            name="Total average rate",
+            line=dict(color="#4C78A8", width=2.5),
+            hovertemplate="σ=%{x:.1f} µs<br>cost=%{y:.1f} Hz<extra></extra>",
+        )
+    )
+    fig_cost.add_trace(
+        go.Scatter(
+            x=cost_sigmas,
+            y=np.full_like(cost_sigmas, cost_budget),
+            mode="lines",
+            name="Budget",
+            line=dict(color="#E45756", width=2, dash="dash"),
+            hovertemplate="budget=%{y:.1f} Hz<extra></extra>",
+        )
+    )
+    fig_cost.add_hrect(
+        y0=cost_budget,
+        y1=max(cost_budget, float(cost_rates.max())) * 1.05 + 1.0,
+        fillcolor="#E45756",
+        opacity=0.08,
+        line_width=0,
+        annotation_text="infeasible",
+        annotation_position="top left",
+    )
+    fig_cost.update_layout(
+        height=340,
+        title_text="Metabolic cost vs tuning width",
+        xaxis_title="σ (µs)",
+        yaxis_title="Total average rate (Hz)",
+        yaxis=dict(rangemode="tozero"),
+        margin=dict(t=60, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+    )
+
+    if cost_feasible.size == 0:
+        cost_note = mo.md(
+            "**No feasible σ** in this range — raise the budget, or lower the "
+            "neuron count / reference rate / spontaneous rate."
+        ).callout(kind="warn")
+    elif cost_feasible.size == cost_sigmas.size:
+        cost_note = mo.md(
+            f"Every σ in [{opt_sigma_limits[0]:.0f}, {opt_sigma_limits[1]:.0f}] µs "
+            f"is feasible (cost peaks at {cost_rates.max():.1f} Hz). The budget is "
+            "not binding, so the optimum below is set purely by decoding accuracy."
+        ).callout(kind="success")
+    else:
+        cost_note = mo.md(
+            f"Feasible σ range: **{cost_feasible.min():.0f} – "
+            f"{cost_feasible.max():.0f} µs** "
+            f"(cost spans {cost_rates.min():.1f} – {cost_rates.max():.1f} Hz)."
+        ).callout(kind="info")
+
+    mo.vstack([fig_cost, cost_note])
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### 2. Sweep σ
+
+    Each σ costs one full encode/decode pass, so the fidelity sliders trade
+    runtime against noise in the RMSE estimate. Start coarse, then refine around
+    the minimum.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    sweep_range = mo.ui.range_slider(
+        5.0,
+        200.0,
+        value=[10.0, 160.0],
+        step=5.0,
+        label="σ range (µs)",
+        show_value=True,
+    )
+    sweep_points = mo.ui.slider(4, 24, value=8, step=1, label="Sweep points")
+    sweep_stimuli = mo.ui.slider(2, 20, value=4, step=1, label="Test ITDs")
+    sweep_trials = mo.ui.slider(5, 60, value=10, step=5, label="Trials / ITD")
+    sweep_duration = mo.ui.slider(
+        0.25, 3.0, value=0.5, step=0.25, label="Trial duration (s)"
+    )
+    sweep_seed = mo.ui.number(0, 9999, value=42, step=1, label="Seed")
+    run_sweep = mo.ui.run_button(label="Run σ sweep")
+    mo.vstack(
+        [
+            mo.hstack([sweep_range, sweep_points], wrap=True),
+            mo.hstack(
+                [sweep_stimuli, sweep_trials, sweep_duration, sweep_seed], wrap=True
+            ),
+            run_sweep,
+        ]
+    )
+    return (
+        run_sweep,
+        sweep_duration,
+        sweep_points,
+        sweep_range,
+        sweep_seed,
+        sweep_stimuli,
+        sweep_trials,
+    )
+
+
+@app.cell
+def _(mo, sweep_duration, sweep_points, sweep_stimuli, sweep_trials):
+    sweep_passes = int(sweep_points.value) * int(sweep_stimuli.value)
+    sweep_sim_seconds = (
+        sweep_passes * int(sweep_trials.value) * float(sweep_duration.value)
+    )
+    mo.md(
+        f"Workload: **{sweep_passes} encode/decode passes** "
+        f"({sweep_sim_seconds:.0f} s of simulated spiking)."
+    )
+    return
+
+
+@app.cell
+def _(
+    make_opt_population,
+    mo,
+    np,
+    opt_budget,
+    opt_grid,
+    run_sweep,
+    sweep_duration,
+    sweep_points,
+    sweep_range,
+    sweep_seed,
+    sweep_stimuli,
+    sweep_trials,
+    sweep_tuning_widths,
+):
+    mo.stop(
+        not run_sweep.value,
+        mo.md("_Click **Run σ sweep** to evaluate decoding across tuning widths._"),
+    )
+
+    sweep_sigmas = np.linspace(
+        float(sweep_range.value[0]),
+        float(sweep_range.value[1]),
+        int(sweep_points.value),
+    )
+    sweep_pop = make_opt_population()
+    sweep_records = []
+    with mo.status.progress_bar(
+        total=len(sweep_sigmas),
+        title="Sweeping σ",
+        subtitle="encoding and MLE-decoding trials",
+    ) as sweep_bar:
+        for sweep_record in sweep_tuning_widths(
+            sweep_pop,
+            sweep_sigmas,
+            opt_grid,
+            float(opt_budget.value),
+            n_test_stimuli=int(sweep_stimuli.value),
+            n_trials_per_stim=int(sweep_trials.value),
+            trial_duration=float(sweep_duration.value),
+            random_seed=int(sweep_seed.value),
+        ):
+            sweep_records.append(sweep_record)
+            sweep_bar.update()
+    return (sweep_records,)
+
+
+@app.cell
+def _(go, make_subplots, mo, np, opt_budget, sweep_records):
+    sweep_sigma_values = np.array([r["sigma"] for r in sweep_records])
+    sweep_rmse = np.array([r["rmse"] for r in sweep_records])
+    sweep_rates = np.array([r["total_rate"] for r in sweep_records])
+    sweep_feasible = np.array([r["feasible"] for r in sweep_records])
+
+    fig_sweep = make_subplots(specs=[[{"secondary_y": True}]])
+    fig_sweep.add_trace(
+        go.Scatter(
+            x=sweep_sigma_values,
+            y=sweep_rmse,
+            mode="lines+markers",
+            name="Decoding RMSE",
+            line=dict(color="#4C78A8", width=2.5),
+            marker=dict(size=8),
+            hovertemplate="σ=%{x:.1f} µs<br>RMSE=%{y:.2f} µs<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    fig_sweep.add_trace(
+        go.Scatter(
+            x=sweep_sigma_values,
+            y=sweep_rates,
+            mode="lines",
+            name="Total rate",
+            line=dict(color="#54A24B", width=2, dash="dot"),
+            hovertemplate="σ=%{x:.1f} µs<br>cost=%{y:.1f} Hz<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    fig_sweep.add_trace(
+        go.Scatter(
+            x=sweep_sigma_values,
+            y=np.full_like(sweep_sigma_values, float(opt_budget.value)),
+            mode="lines",
+            name="Budget",
+            line=dict(color="#E45756", width=2, dash="dash"),
+            hovertemplate="budget=%{y:.1f} Hz<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+
+    if sweep_feasible.any():
+        sweep_best_idx = int(np.argmin(np.where(sweep_feasible, sweep_rmse, np.inf)))
+        fig_sweep.add_trace(
+            go.Scatter(
+                x=[sweep_sigma_values[sweep_best_idx]],
+                y=[sweep_rmse[sweep_best_idx]],
+                mode="markers",
+                name="Best feasible σ",
+                marker=dict(color="#B279A2", size=16, symbol="star"),
+                hovertemplate="best σ=%{x:.1f} µs<br>RMSE=%{y:.2f} µs<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+        sweep_note = mo.md(
+            f"Best feasible σ on this grid: **{sweep_sigma_values[sweep_best_idx]:.1f} µs** "
+            f"→ RMSE **{sweep_rmse[sweep_best_idx]:.2f} µs**, cost "
+            f"{sweep_rates[sweep_best_idx]:.1f} Hz. Use it as the optimizer's "
+            "starting point below."
+        ).callout(kind="info")
+    else:
+        sweep_note = mo.md(
+            "No swept σ satisfies the budget — raise the budget or shrink the population."
+        ).callout(kind="warn")
+
+    fig_sweep.update_yaxes(
+        title_text="Decoding RMSE (µs)", rangemode="tozero", secondary_y=False
+    )
+    fig_sweep.update_yaxes(
+        title_text="Total average rate (Hz)", rangemode="tozero", secondary_y=True
+    )
+    fig_sweep.update_layout(
+        height=430,
+        title_text="Objective and constraint vs tuning width",
+        xaxis_title="σ (µs)",
+        margin=dict(t=60, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        hovermode="x unified",
+    )
+    mo.vstack([fig_sweep, sweep_note])
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### 3. Constrained optimization
+
+    COBYLA and SLSQP both handle the inequality constraint directly. Objective
+    and constraint share a cached evaluation per σ, so each visited width costs
+    one encode/decode pass rather than two. Evaluation fidelity is inherited
+    from the sweep controls above; COBYLA spends the budget below on function
+    evaluations, SLSQP on iterations.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    fit_method = mo.ui.dropdown(
+        options=["COBYLA", "SLSQP"], value="COBYLA", label="Method"
+    )
+    fit_sigma_init = mo.ui.slider(5.0, 200.0, value=50.0, step=5.0, label="Initial σ (µs)")
+    fit_maxiter = mo.ui.slider(5, 60, value=20, step=5, label="Optimizer budget")
+    run_fit = mo.ui.run_button(label="Run optimizer")
+    mo.hstack([fit_method, fit_sigma_init, fit_maxiter, run_fit], wrap=True)
+    return fit_maxiter, fit_method, fit_sigma_init, run_fit
+
+
+@app.cell
+def _(
+    fit_maxiter,
+    fit_method,
+    fit_sigma_init,
+    make_opt_population,
+    mo,
+    opt_budget,
+    opt_grid,
+    opt_sigma_limits,
+    optimize_tuning_width,
+    run_fit,
+    sweep_duration,
+    sweep_seed,
+    sweep_stimuli,
+    sweep_trials,
+):
+    mo.stop(
+        not run_fit.value,
+        mo.md("_Click **Run optimizer** to search for the best feasible σ._"),
+    )
+
+    fit_pop = make_opt_population()
+    with mo.status.spinner(
+        title=f"Optimizing σ with {fit_method.value}",
+        subtitle="each step encodes and decodes a fresh set of trials",
+    ):
+        fit_result, fit_trace = optimize_tuning_width(
+            fit_pop,
+            opt_grid,
+            rate_budget=float(opt_budget.value),
+            sigma_init=float(fit_sigma_init.value),
+            sigma_bounds=opt_sigma_limits,
+            method=str(fit_method.value),
+            maxiter=int(fit_maxiter.value),
+            eval_kwargs=dict(
+                n_test_stimuli=int(sweep_stimuli.value),
+                n_trials_per_stim=int(sweep_trials.value),
+                trial_duration=float(sweep_duration.value),
+                random_seed=int(sweep_seed.value),
+            ),
+        )
+    return fit_pop, fit_result, fit_trace
+
+
+@app.cell
+def _(fit_result, fit_trace, go, make_subplots, mo, np):
+    trace_sigmas = np.array([r["sigma"] for r in fit_trace])
+    trace_rmse = np.array([r["rmse"] for r in fit_trace])
+    trace_steps = np.arange(len(fit_trace))
+    trace_running_best = np.minimum.accumulate(trace_rmse)
+
+    fig_fit = make_subplots(
+        rows=1,
+        cols=2,
+        subplot_titles=("Widths visited", "Convergence"),
+        horizontal_spacing=0.11,
+    )
+    fig_fit.add_trace(
+        go.Scatter(
+            x=trace_sigmas,
+            y=trace_rmse,
+            mode="markers",
+            name="Evaluations",
+            marker=dict(
+                size=11,
+                color=trace_steps,
+                colorscale="Viridis",
+                showscale=True,
+                colorbar=dict(title="step", x=0.44, thickness=12),
+            ),
+            hovertemplate="step %{marker.color}<br>σ=%{x:.1f} µs<br>RMSE=%{y:.2f} µs<extra></extra>",
+        ),
+        row=1,
+        col=1,
+    )
+    fig_fit.add_trace(
+        go.Scatter(
+            x=trace_steps,
+            y=trace_rmse,
+            mode="lines+markers",
+            name="RMSE",
+            line=dict(color="#4C78A8", width=2),
+            hovertemplate="step %{x}<br>RMSE=%{y:.2f} µs<extra></extra>",
+        ),
+        row=1,
+        col=2,
+    )
+    fig_fit.add_trace(
+        go.Scatter(
+            x=trace_steps,
+            y=trace_running_best,
+            mode="lines",
+            name="Running best",
+            line=dict(color="#B279A2", width=2, dash="dash"),
+            hovertemplate="step %{x}<br>best=%{y:.2f} µs<extra></extra>",
+        ),
+        row=1,
+        col=2,
+    )
+    fig_fit.update_xaxes(title_text="σ (µs)", row=1, col=1)
+    fig_fit.update_xaxes(title_text="Evaluation", row=1, col=2)
+    fig_fit.update_yaxes(title_text="Decoding RMSE (µs)", rangemode="tozero")
+    fig_fit.update_layout(
+        height=400,
+        margin=dict(t=60, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.08, x=0),
+    )
+
+    fit_message = f"{fit_result.message} ({len(fit_trace)} evaluations)"
+    mo.vstack([fig_fit, mo.md(f"_{fit_message}_")])
+    return
+
+
+@app.cell
+def _(fit_pop, fit_result, fit_trace, mo, np, opt_budget, opt_grid):
+    fit_sigma = float(fit_result.x[0])
+    fit_best = min(fit_trace, key=lambda r: r["rmse"])
+    fit_start = fit_trace[0]
+    fit_rates = fit_pop.compute_rates(opt_grid)
+    fit_total_rate = float(np.sum(np.mean(fit_rates, axis=1)))
+    fit_improvement = 100.0 * (1.0 - fit_best["rmse"] / fit_start["rmse"])
+
+    fit_stats = mo.hstack(
+        [
+            mo.stat(f"{fit_sigma:.1f} µs", label="Optimized σ", bordered=True),
+            mo.stat(f"{fit_best['rmse']:.2f} µs", label="Best RMSE", bordered=True),
+            mo.stat(
+                f"{fit_improvement:.1f}%",
+                label="RMSE improvement",
+                caption=f"from {fit_start['rmse']:.2f} µs at σ={fit_start['sigma']:.1f} µs",
+                bordered=True,
+            ),
+            mo.stat(
+                f"{fit_total_rate:.1f} Hz",
+                label="Total rate",
+                caption=f"budget {float(opt_budget.value):.0f} Hz",
+                bordered=True,
+            ),
+        ],
+        wrap=True,
+    )
+
+    fit_table = mo.ui.table(
+        [
+            {
+                "neuron": idx,
+                "preferred ITD (µs)": round(float(fit_pop.means[idx]), 1),
+                "σ (µs)": round(float(fit_pop.sigmas[idx]), 1),
+                "avg rate (Hz)": round(float(np.mean(fit_rates[idx, :])), 2),
+            }
+            for idx in range(fit_pop.n_neurons)
+        ],
+        selection=None,
+        label="Optimized population",
+    )
+    mo.vstack([fit_stats, fit_table])
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Takeaways
+
+    - An optimal tuning width exists: too narrow leaves coverage gaps, too broad
+      wastes spikes on uninformative neurons.
+    - Under area-conserving normalization the rate budget is nearly flat in
+      $\sigma$, so it constrains population size and baseline rate more than
+      width. Shrink the budget or raise the neuron count to make it bind.
+    - The objective is a noisy black box (spikes are resampled per evaluation),
+      so derivative-based methods can stall; a coarse sweep plus a local
+      optimizer is more reliable than the optimizer alone.
     """)
     return
 

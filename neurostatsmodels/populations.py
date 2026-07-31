@@ -642,14 +642,21 @@ class GaussianTunedPopulation:
             return np.sum(fisher_info)
         return np.sum(fisher_info, axis=0)
 
-    def decode_mle(self, tsgroup, stimulus_range=None):
+    def decode_mle(
+        self,
+        tsgroup,
+        stimulus_range=None,
+        n_time_steps=1000,
+    ):
         """Maximum-likelihood stimulus decode from spike counts (Poisson model).
 
         For independent Poisson neurons observed for duration ``T``,
 
         ``log L(s) = sum_i [n_i * log(r_i(s)) - r_i(s) * T]``
 
-        where ``n_i`` is the trial spike count. Searches a 1D stimulus grid and
+        where ``n_i`` is the trial spike count, ``r_i(s)`` is the firing rate of
+        neuron ``i`` at stimulus ``s``, and ``T`` is the trial duration.
+        Searches a 1D stimulus grid and
         returns the argmax per trial. Ignores timing structure within the trial
         (rate-code / count-based decoder).
 
@@ -660,7 +667,8 @@ class GaussianTunedPopulation:
         stimulus_range : tuple, optional
             ``(min, max)`` search range. If None, uses stored ``stimulus_grid``
             or a range around the neuron means.
-
+        n_time_steps : int, optional
+            Number of time steps to search over. Default is 1000.
         Returns
         -------
         s_mle : ndarray, shape (n_trials,)
@@ -681,9 +689,9 @@ class GaussianTunedPopulation:
                 # Default: use range around neuron means
                 stim_min = np.min(self.means) - 3 * np.max(self.sigmas)
                 stim_max = np.max(self.means) + 3 * np.max(self.sigmas)
-                stim_grid = np.linspace(stim_min, stim_max, 1000)
+                stim_grid = np.linspace(stim_min, stim_max, n_time_steps)
         else:
-            stim_grid = np.linspace(stimulus_range[0], stimulus_range[1], 1000)
+            stim_grid = np.linspace(stimulus_range[0], stimulus_range[1], n_time_steps)
 
         # Compute firing rates for all stimulus values
         rates = self.compute_rates(stim_grid)  # shape: (n_neurons, n_stim)
